@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+
+# sysdawg - Junior SRE Copilot powered by Mistral 7B
+# A read-only diagnostic assistant for system administration
+# Runs on orion, queries Mistral 7B on apollo via SSH
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+OLLAMA_MODEL="mistral"
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_error() {
+  echo -e "${RED}✗ Error: $*${NC}" >&2
+}
+
+log_warn() {
+  echo -e "${YELLOW}⚠ $*${NC}" >&2
+}
+
+log_info() {
+  echo -e "${BLUE}ℹ $*${NC}" >&2
+}
+
+log_success() {
+  echo -e "${GREEN}✓ $*${NC}" >&2
+}
+
+show_help() {
+  cat <<EOF
+${CYAN}sysdawg${NC} - Junior SRE Copilot
+
+${BLUE}Usage:${NC}
+  sysdawg [OPTIONS] [QUESTION]
+
+${BLUE}Options:${NC}
+  -h, --help          Show this help message
+  --setup             Run SSH setup wizard
+  --version           Show version
+
+${BLUE}Examples:${NC}
+  sysdawg "why did my system suspend?"
+  sysdawg "check if SSH service is healthy"
+  sysdawg --setup     # First time setup
+
+${BLUE}About:${NC}
+  sysdawg is a read-only diagnostic tool that leverages Mistral 7B running
+  on apollo to analyze your system state. It gathers diagnostics and sends
+  them to Mistral for analysis and advice.
+
+  Never runs commands on your system. Always advisory.
+
+${BLUE}Setup:${NC}
+  1. cp .env.example .env
+  2. Edit .env with apollo connection details
+  3. sysdawg --setup    # Configure SSH
+
+EOF
+}
+
+# Check .env file exists
+check_env() {
+  if [ ! -f "$ENV_FILE" ]; then
+    log_error ".env file not found at $ENV_FILE"
+    echo ""
+    echo "Create it from the template:"
+    echo "  cp $SCRIPT_DIR/.env.example $ENV_FILE"
+    echo "  # Edit $ENV_FILE with apollo connection details"
+    echo ""
+    exit 1
+  fi
+}
+
+# Load and validate environment
+load_env() {
+  # shellcheck disable=SC1090
+  source "$ENV_FILE" || {
+    log_error "Failed to load .env file"
+    exit 1
+  }
+
+  # Validate required variables
+  if [ -z "${APOLLO_HOST:-}" ] || [ -z "${APOLLO_USER:-}" ]; then
+    log_error "APOLLO_HOST and APOLLO_USER must be set in .env"
+    exit 1
+  fi
+
+  APOLLO_PORT="${APOLLO_PORT:-22}"
+}
+
+# Test SSH connection
+test_ssh_connection() {
+  log_info "Testing SSH connection to $APOLLO_USER@$APOLLO_HOST:$APOLLO_PORT"
+
+  if ssh -p "$APOLLO_PORT" "$APOLLO_USER@$APOLLO_HOST" "echo 'SSH OK'" >/dev/null 2>&1; then
+    log_success "SSH connection successful"
+    return 0
+  else
+    log_error "SSH connection failed"
+    echo ""
+    echo "Troubleshooting:"
+    echo "  1. Check apollo is reachable: ping $APOLLO_HOST"
+    echo "  2. Check .env credentials"
+    echo "  3. Run: sysdawg --setup"
+    echo ""
+    exit 1
+  fi
+}
+
+# Gather system diagnostics
+gather_diagnostics() {
+  local diagnostics=""
+
+  log_info "Gathering system diagnostics..." >&2
+
+  diagnostics+="=== SYSTEM INFO ==="$'\n'
+  diagnostics+="$(uname -a)"$'\n'
+  diagnostics+=$'\n'
+
+  diagnostics+="=== UPTIME ==="$'\n'
+  diagnostics+="$(uptime)"$'\n'
+  diagnostics+=$'\n'
+
+  diagnostics+="=== MEMORY ==="$'\n'
+  diagnostics+="$(free -h)"$'\n'
+  diagnostics+=$'\n'
+
+  diagnostics+="=== DISK SPACE ==="$'\n'
+  diagnostics+="$(df -h)"$'\n'
+  diagnostics+=$'\n'
+
+  diagnostics+="=== LOAD AVERAGE ==="$'\n'
+  diagnostics+="$(cat /proc/loadavg)"$'\n'
+  diagnostics+=$'\n'
+
+  # Get last 50 lines of systemd journal
+  diagnostics+="=== RECENT SYSTEMD LOG ==="$'\n'
+  diagnostics+="$(journalctl -b --no-pager | tail -n 50)"$'\n'
+
+  echo "$diagnostics"
+}
+
+# Build the system prompt for Mistral
+build_prompt() {
+  local question="$1"
+  local diagnostics="$2"
+
+  cat <<'PROMPT'
+You are a junior Linux sysadmin assistant. Your role is to help diagnose and explain system issues.
+
+CRITICAL RULES:
+1. You are READ-ONLY. Never suggest commands that modify the system.
+2. For each command suggestion, include:
+   - What it does
+   - Risk level (SAFE / REVIEW / DANGEROUS)
+   - How to undo it (if applicable)
+3. Prefer diagnostic checklists over fixes.
+4. If unsure, explicitly say so.
+5. Never suggest: sudo, rm, mkfs, dd, service restarts, iptables -F, or package managers
+
+OUTPUT FORMAT:
+## Summary
+Brief explanation of what's likely happening.
+
+## Likely Causes
+Ranked by probability (1 = most likely).
+
+## What to Check Next
+Read-only commands ONLY. Guide the user through a diagnostic ladder.
+
+## Suggested Commands
+If needed, with risk assessment and undo steps.
+
+## Confidence Level
+Express how confident you are in this analysis.
+
+---
+
+USER QUESTION:
+PROMPT
+
+  echo "$question"
+  echo ""
+  echo "SYSTEM STATE:"
+  echo "$diagnostics"
+}
+
+# Send prompt to Mistral via apollo
+send_to_mistral() {
+  local prompt="$1"
+
+  log_info "Sending to Mistral on apollo..." >&2
+
+  # SSH to apollo, pipe prompt to ollama
+  echo "$prompt" | ssh -p "$APOLLO_PORT" "$APOLLO_USER@$APOLLO_HOST" "ollama run $OLLAMA_MODEL"
+}
+
+# Main flow
+main() {
+  local question=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        show_help
+        exit 0
+        ;;
+      --version)
+        echo "sysdawg v0.1.0 (Step 1 MVP)"
+        exit 0
+        ;;
+      --setup)
+        # Run setup script
+        if [ -f "$SCRIPT_DIR/setup-ssh.sh" ]; then
+          bash "$SCRIPT_DIR/setup-ssh.sh"
+          exit 0
+        else
+          log_error "setup-ssh.sh not found"
+          exit 1
+        fi
+        ;;
+      -*)
+        log_error "Unknown option: $1"
+        echo ""
+        show_help
+        exit 1
+        ;;
+      *)
+        # Concatenate remaining arguments as the question
+        question="$*"
+        break
+        ;;
+    esac
+  done
+
+  # Validate question
+  if [ -z "$question" ]; then
+    echo "sysdawg - Junior SRE Copilot"
+    echo ""
+    show_help
+    exit 0
+  fi
+
+  # Check prerequisites
+  check_env
+  load_env
+
+  # Verify SSH is working
+  test_ssh_connection
+
+  # Gather diagnostics
+  local diagnostics
+  diagnostics=$(gather_diagnostics)
+
+  # Build and send prompt
+  local prompt
+  prompt=$(build_prompt "$question" "$diagnostics")
+
+  echo ""
+  echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}Mistral 7B Analysis${NC}"
+  echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+
+  # Send to Mistral and capture response
+  send_to_mistral "$prompt"
+
+  echo ""
+  echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# Run main
+main "$@"
