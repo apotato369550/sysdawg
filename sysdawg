@@ -108,6 +108,8 @@ load_env() {
   APOLLO_USER="${APOLLO_USER:-$DEFAULT_APOLLO_USER}"
   APOLLO_PORT="${APOLLO_PORT:-$DEFAULT_APOLLO_PORT}"
 
+  log_info "Model configured: $OLLAMA_MODEL"
+
   # Show what we're using
   if [ ! -f "$ENV_FILE" ]; then
     log_info "Using default connection: $APOLLO_USER@$APOLLO_HOST:$APOLLO_PORT"
@@ -233,6 +235,11 @@ build_user_message() {
     message+="[END HISTORY]"$'\n\n'
   fi
 
+  # Reinforce persona if using custom model
+  if [[ "$OLLAMA_MODEL" == "sysdawg" ]]; then
+    message+="Remember: You are sysdawg, the friendly junior SRE copilot. Stay in character."$'\n\n'
+  fi
+
   # Add the actual user question with emphasis
   message+="**USER QUESTION:** $user_question"
 
@@ -261,9 +268,19 @@ send_to_mistral() {
   local user_message="$2"
 
   # Escape messages for JSON
-  local escaped_system escaped_user
-  escaped_system=$(json_escape "$system_message")
-  escaped_user=$(json_escape "$user_message")
+  local escaped_content
+
+  # Logic for handling system prompts:
+  # 1. If using the custom 'sysdawg' model, the prompt is baked in. Sending it again
+  #    can confuse the model or trigger refusals. We send ONLY the user message.
+  # 2. If using generic 'mistral' (or others), we must inject the prompt.
+  #    We merge it into the user message because 'role: system' is often ignored.
+  if [[ "$OLLAMA_MODEL" == "sysdawg" ]]; then
+    escaped_content=$(json_escape "$user_message")
+  else
+    local combined_message="$system_message"$'\n\n'"$user_message"
+    escaped_content=$(json_escape "$combined_message")
+  fi
 
   # Build JSON request manually (bash-native)
   local json_request
@@ -271,11 +288,11 @@ send_to_mistral() {
 {
   "model": "$OLLAMA_MODEL",
   "messages": [
-    {"role": "system", "content": "$escaped_system"},
-    {"role": "user", "content": "$escaped_user"}
+    {"role": "user", "content": "$escaped_content"}
   ],
   "stream": false,
   "options": {
+    "num_ctx": 8192,
     "temperature": 0.7,
     "top_p": 0.9
   }
