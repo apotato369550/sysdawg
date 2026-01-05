@@ -78,6 +78,43 @@ OLLAMA_API_URL=http://localhost:11434/api/chat  # Ollama API endpoint
 
 Run `./setup-ssh.sh` to create this file interactively. Never commit `.env` to version control.
 
+## Custom Models
+
+To make the persona more robust, you can bake the system prompt directly into a custom Ollama model. This is the recommended approach for better adherence to safety rules.
+
+### 1. Create the Model
+
+You can create the custom model either locally (if you run Ollama locally) or on your remote host (`apollo`).
+
+**Option A: Create on Remote Host (Recommended)**
+
+1. Copy the Modelfile to your server:
+   ```bash
+   scp ollama_model/Modelfile user@apollo:~/sysdawg.Modelfile
+   ```
+2. SSH into the server and build the model:
+   ```bash
+   ssh user@apollo "ollama create sysdawg -f ~/sysdawg.Modelfile"
+   ```
+
+**Option B: Create Locally**
+
+If you are running Ollama on your local machine:
+```bash
+ollama create sysdawg -f ollama_model/Modelfile
+```
+
+### 2. Configure sysdawg to Use It
+
+Update your `.env` file to use the new model name:
+
+```bash
+# In .env
+OLLAMA_MODEL=sysdawg
+```
+
+Now `sysdawg` will use your custom-tuned model which has the persona and safety rules permanently embedded.
+
 ## Architecture
 
 ### Multi-Machine Setup
